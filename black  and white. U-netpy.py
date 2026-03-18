@@ -120,11 +120,10 @@ def tensor2rgb(L_tensor, ab_tensor):
     lab[:, :, 0] = L
     lab[:, :, 1:] = ab
 
-    # 转回 BGR 再到 RGB
-    bgr = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
-    rgb = np.clip(bgr, 0, 1)  # 限制在 0-1 之间
-    return rgb
 
+    rgb_img = cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
+    rgb_img = np.clip(rgb_img, 0, 1) # 限制在 0-1 之间供 plt 显示
+    return rgb_img
 
 
 # 4. 训练与可视化
