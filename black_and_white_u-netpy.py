@@ -132,7 +132,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # 修改此处路径为 ImageNet100 的路径
-    train_dir = './imagenet100/train'
+    train_dir = '/root/autodl-tmp/ImageNet100'
 
     # 如果路径不存在，这里用随机数据替代以便代码能够运行
     if not os.path.exists(train_dir):
@@ -185,23 +185,27 @@ if __name__ == "__main__":
         # 灰度图直接显示 L 通道
         gray_img = (L_img.cpu().squeeze().numpy() + 1.0) / 2.0
 
-        # matplotlib 绘图
+        # --- matplotlib 绘图 ---
         plt.figure(figsize=(15, 5))
 
+        # 1. 原图 (Ground Truth)
         plt.subplot(1, 3, 1)
-        plt.title("Input (Grayscale)")
-        plt.imshow(gray_img, cmap='gray')
-        plt.axis('off')
-
-        plt.subplot(1, 3, 2)
-        plt.title("Prediction (Colorized)")
-        plt.imshow(pred_rgb)
-        plt.axis('off')
-
-        plt.subplot(1, 3, 3)
-        plt.title("Ground Truth (Original)")
+        plt.title("Original Image")
         plt.imshow(gt_rgb)
         plt.axis('off')
 
+        # 2. L通道图 (Grayscale Input)
+        plt.subplot(1, 3, 2)
+        plt.title("L Channel (Grayscale)")
+        plt.imshow(gray_img, cmap='gray')
+        plt.axis('off')
+
+        # 3. 最终的合成图 (Prediction)
+        plt.subplot(1, 3, 3)
+        plt.title("Synthesized Image")
+        plt.imshow(pred_rgb)
+        plt.axis('off')
+
         plt.tight_layout()
+        #  PyCharm 中弹窗展示
         plt.show()
