@@ -11,14 +11,23 @@ import os
 # 1. 数据集 ( ImageNet100)
 
 class ImageNetColorizationDataset(Dataset):
-    def __init__(self, root_dir, img_size=256):
-        #  ImageFolder 读取本地 ImageNet100
+    def __init__(self, root_dir, img_size=256, is_train=True):
+        # 训练集增加随机水平翻转，验证/测试集仅做中心裁剪
+        if is_train:
+            transform_list = [
+                transforms.Resize((img_size, img_size)),
+                transforms.RandomHorizontalFlip(),
+                transforms.CenterCrop(img_size)
+            ]
+        else:
+            transform_list = [
+                transforms.Resize((img_size, img_size)),
+                transforms.CenterCrop(img_size)
+            ]
+
         self.dataset = datasets.ImageFolder(
             root=root_dir,
-            transform=transforms.Compose([
-                transforms.Resize((img_size, img_size)),
-                transforms.CenterCrop(img_size)  # 保证严格的尺寸
-            ])
+            transform=transforms.Compose(transform_list)
         )
 
     def __len__(self):
@@ -131,25 +140,32 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # 修改此处路径为 ImageNet100 的路径
+    # 1. 更新为真实的 ImageNet100 路径
     train_dir = '/root/autodl-tmp/ImageNet100'
 
-    # 如果路径不存在，这里用随机数据替代以便代码能够运行
     if not os.path.exists(train_dir):
-        print("Warning: ImageNet directory not found. Using fake data for demonstration.")
-    else:
-        train_dataset = ImageNetColorizationDataset(root_dir=train_dir, img_size=256)
+        print(f"Error: 找不到路径 {train_dir}，请检查路径是否正确！")
+        exit()
 
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    train_dataset = ImageNetColorizationDataset(root_dir=train_dir, img_size=256, is_train=True)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
 
+    # 2. 模型、损失函数与优化器定义
     model = UNet(in_channels=1, out_channels=2).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)  # 微调了 lr
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
 
-    # 简化版训练循环 (仅演示 1 Epoch)
-    num_epochs = 1
+    # 3. 指定参数和图片保存路径 (自动创建文件夹)
+    checkpoint_dir = '/root/autodl-tmp/optimizer_dataset'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    best_loss = float('inf')
+
+    # 4. 正式训练循环
+    num_epochs = 20
     for epoch in range(num_epochs):
         model.train()
+        running_loss = 0.0
+
         for i, (L_batch, ab_batch) in enumerate(train_loader):
             L_batch, ab_batch = L_batch.to(device), ab_batch.to(device)
 
@@ -159,53 +175,69 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
 
-            if i % 10 == 0:
-                print(f"Epoch [{epoch + 1}/{num_epochs}], Step [{i}], Loss: {loss.item():.4f}")
+            running_loss += loss.item()
 
-            break  # 实际训练请删除此 break
+            if (i + 1) % 100 == 0:
+                print(f"Epoch [{epoch + 1}/{num_epochs}], Step [{i + 1}], Loss: {loss.item():.4f}")
 
-    # --- 可视化抽取 (推理与展示) ---
-    print("Extracting images for visualization...")
-    model.eval()
-    with torch.no_grad():
-        # 取一个 Batch
-        L_val, ab_val = next(iter(train_loader))
-        L_val = L_val.to(device)
-        ab_pred_val = model(L_val)
+        # 计算本轮平均 Loss
+        avg_loss = running_loss / len(train_loader)
+        print(f"=== Epoch [{epoch + 1}/{num_epochs}] Average Loss: {avg_loss:.4f} ===")
 
-        # 挑出 Batch 中的第一张图
-        L_img = L_val[0]
-        ab_true_img = ab_val[0]
-        ab_pred_img = ab_pred_val[0]
+        # 5. 自动保存模型参数
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': avg_loss
+        }
 
-        # 转换回 RGB
-        gt_rgb = tensor2rgb(L_img, ab_true_img)
-        pred_rgb = tensor2rgb(L_img, ab_pred_img)
+        torch.save(checkpoint, os.path.join(checkpoint_dir, 'unet_latest.pth'))
 
-        # 灰度图直接显示 L 通道
-        gray_img = (L_img.cpu().squeeze().numpy() + 1.0) / 2.0
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(checkpoint, os.path.join(checkpoint_dir, 'unet_best.pth'))
+            print(f"[*] 发现更优模型！已将参数保存至 {checkpoint_dir}/unet_best.pth")
 
-        # --- matplotlib 绘图 ---
-        plt.figure(figsize=(15, 5))
+        # ==========================================
+        # 6. 核心修改：每 5 个 Epoch 自动保存一次可视化结果，不阻塞进程
+        # ==========================================
+        if (epoch + 1) % 5 == 0:
+            model.eval()
+            with torch.no_grad():
+                L_val, ab_val = next(iter(train_loader))
+                L_val = L_val.to(device)
+                ab_pred_val = model(L_val)
 
-        # 1. 原图 (Ground Truth)
-        plt.subplot(1, 3, 1)
-        plt.title("Original Image")
-        plt.imshow(gt_rgb)
-        plt.axis('off')
+                L_img = L_val[0]
+                ab_true_img = ab_val[0]
+                ab_pred_img = ab_pred_val[0]
 
-        # 2. L通道图 (Grayscale Input)
-        plt.subplot(1, 3, 2)
-        plt.title("L Channel (Grayscale)")
-        plt.imshow(gray_img, cmap='gray')
-        plt.axis('off')
+                gt_rgb = tensor2rgb(L_img, ab_true_img)
+                pred_rgb = tensor2rgb(L_img, ab_pred_img)
+                gray_img = (L_img.cpu().squeeze().numpy() + 1.0) / 2.0
 
-        # 3. 最终的合成图 (Prediction)
-        plt.subplot(1, 3, 3)
-        plt.title("Synthesized Image")
-        plt.imshow(pred_rgb)
-        plt.axis('off')
+                plt.figure(figsize=(15, 5))
 
-        plt.tight_layout()
-        #  PyCharm 中弹窗展示
-        plt.show()
+                plt.subplot(1, 3, 1)
+                plt.title("Original Image")
+                plt.imshow(gt_rgb)
+                plt.axis('off')
+
+                plt.subplot(1, 3, 2)
+                plt.title("L Channel (Grayscale)")
+                plt.imshow(gray_img, cmap='gray')
+                plt.axis('off')
+
+                plt.subplot(1, 3, 3)
+                plt.title(f"Synthesized Image (Epoch {epoch + 1})")
+                plt.imshow(pred_rgb)
+                plt.axis('off')
+
+                plt.tight_layout()
+
+                # 直接保存为图片到权重同一个文件夹下，并关闭画板
+                save_path = os.path.join(checkpoint_dir, f'epoch_{epoch + 1}_vis.png')
+                plt.savefig(save_path, bbox_inches='tight')
+                plt.close()  # 释放内存，防止 OOM
+                print(f"[*] 已生成对比图并自动保存至: {save_path}")
