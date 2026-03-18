@@ -188,7 +188,7 @@ if __name__ == "__main__":
     model = AttentionUNet().to(device)
     criterion_mse = nn.MSELoss()
     criterion_perceptual = PerceptualLoss().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
 
     best_loss = float('inf')
     num_epochs = 10
@@ -216,7 +216,7 @@ if __name__ == "__main__":
             loss_p = criterion_perceptual(input_vgg_pred.expand(-1, 3, -1, -1),
                                           input_vgg_gt.expand(-1, 3, -1, -1))
 
-            total_loss = loss_mse + 0.1 * loss_p
+            total_loss = loss_mse + 0.2 * loss_p
             total_loss.backward()
             optimizer.step()
 
