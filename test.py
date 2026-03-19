@@ -7,9 +7,10 @@ import numpy as np
 import cv2
 import matplotlib.pyplot as plt
 import random
+from tqdm import tqdm
 
 
-# 1. 数据集定义 (保持不变)
+# 1. 数据集定义：修复了原图返回格式，确保 DataLoader 兼容
 class CIFAR10ColorizationDataset(Dataset):
     def __init__(self, root='./data', train=True):
         self.dataset = torchvision.datasets.CIFAR10(root=root, train=train, download=True)
@@ -20,6 +21,8 @@ class CIFAR10ColorizationDataset(Dataset):
     def __getitem__(self, idx):
         img_pil, _ = self.dataset[idx]
         img_rgb = np.array(img_pil)
+
+        # 转换到 Lab 空间
         img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
         img_bgr_f32 = img_bgr.astype(np.float32) / 255.0
         img_lab = cv2.cvtColor(img_bgr_f32, cv2.COLOR_BGR2Lab)
@@ -27,17 +30,20 @@ class CIFAR10ColorizationDataset(Dataset):
         L = img_lab[:, :, 0]
         ab = img_lab[:, :, 1:]
 
+        # 归一化到 [-1, 1]
         L_norm = (L / 50.0) - 1.0
         ab_norm = ab / 127.0
 
-        # 转换为 Tensor: (C, H, W)
         L_tensor = torch.from_numpy(L_norm).unsqueeze(0).float()
         ab_tensor = torch.from_numpy(ab_norm.transpose(2, 0, 1)).float()
 
-        return L_tensor, ab_tensor, img_rgb  # 额外返回原图用于对比
+        # 修正：将原图转为 Tensor 避免 DataLoader 在 batch 拼接时报错
+        img_rgb_tensor = torch.from_numpy(img_rgb).permute(2, 0, 1)
+
+        return L_tensor, ab_tensor, img_rgb_tensor
 
 
-# 2. 增强版 U-Net 模型 (增加通道数)
+# 2. 增强版 U-Net：基础通道数提升至 128
 class ConvBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -56,8 +62,7 @@ class ConvBlock(nn.Module):
 class UNet(nn.Module):
     def __init__(self, in_channels=1, out_channels=2):
         super().__init__()
-        # 基础通道数从 64 增加到 128
-        base = 128
+        base = 128  # 增加通道数以利用 5060 性能
         self.enc1 = ConvBlock(in_channels, base)
         self.enc2 = ConvBlock(base, base * 2)
         self.enc3 = ConvBlock(base * 2, base * 4)
@@ -78,7 +83,6 @@ class UNet(nn.Module):
         s3 = self.enc3(p2)
 
         u2 = self.up2(s3)
-        # CIFAR-10 图片小，通常不需要 padding 调整，直接拼接
         m2 = torch.cat([u2, s2], dim=1)
         d2 = self.dec2(m2)
 
@@ -89,75 +93,76 @@ class UNet(nn.Module):
         return torch.tanh(self.final(d1))
 
 
-# 3. 可视化函数 (抽取 5 张图)
+# 3. 可视化函数：修复了色彩转换逻辑和维度拼接
 def visualize_results(model, dataset, device, num_samples=5):
     model.eval()
-    fig, axes = plt.subplots(num_samples, 3, figsize=(12, 15))
-    plt.subplots_adjust(hspace=0.4)
+    fig, axes = plt.subplots(num_samples, 3, figsize=(10, 15))
 
     indices = random.sample(range(len(dataset)), num_samples)
 
     for i, idx in enumerate(indices):
-        L_tensor, ab_true, img_rgb = dataset[idx]
+        L_tensor, _, img_rgb_tensor = dataset[idx]
+        original_rgb = img_rgb_tensor.permute(1, 2, 0).numpy()
 
-        # 预测
         input_L = L_tensor.unsqueeze(0).to(device)
         with torch.no_grad():
             output_ab = model(input_L).cpu().squeeze(0).numpy()
 
-        # 后处理预测图
+        # 反归一化
         L_norm = L_tensor.squeeze().numpy()
         L_rescaled = (L_norm + 1.0) * 50.0
         ab_rescaled = output_ab.transpose(1, 2, 0) * 127.0
 
-        lab_pred = np.concatenate([L_rescaled[:, :, np.newaxis], ab_rescaled], axis=2).astype(np.float32)
-        # Lab 转 RGB
+        # 构造 Lab 图像
+        lab_pred = np.zeros((32, 32, 3), dtype=np.float32)
+        lab_pred[:, :, 0] = L_rescaled
+        lab_pred[:, :, 1:] = ab_rescaled
+
+        # 修正：Lab -> BGR -> RGB 的转换逻辑
         bgr_pred = cv2.cvtColor(lab_pred, cv2.COLOR_Lab2BGR)
-        rgb_pred = cv2.cvtColor(bgr_pred, cv2.COLOR_BGR2RGB)
-        rgb_pred = np.clip(rgb_pred * 255, 0, 255).astype(np.uint8)
+        rgb_pred = cv2.cvtColor(np.clip(bgr_pred, 0, 1), cv2.COLOR_BGR2RGB)
+        rgb_pred = (rgb_pred * 255).astype(np.uint8)
 
-        # 展示原图
-        axes[i, 0].imshow(img_rgb)
-        axes[i, 0].set_title("Original RGB")
-        axes[i, 0].axis('off')
-
-        # 展示灰度图 (L 通道)
+        axes[i, 0].imshow(original_rgb)
+        axes[i, 0].set_title("Original")
         axes[i, 1].imshow(L_rescaled, cmap='gray')
-        axes[i, 1].set_title("Input L (Gray)")
-        axes[i, 1].axis('off')
-
-        # 展示预测图
+        axes[i, 1].set_title("Input (Gray)")
         axes[i, 2].imshow(rgb_pred)
-        axes[i, 2].set_title("Predicted RGB")
-        axes[i, 2].axis('off')
+        axes[i, 2].set_title("Predicted")
+        for ax in axes[i]: ax.axis('off')
 
+    plt.tight_layout()
     plt.show()
 
 
-# 4. 主训练流程
+# 4. 主程序
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"当前运行设备: {device}")
 
-    # 针对 RTX 5060 的优化参数
+    # 超参数优化
     BATCH_SIZE = 128
     EPOCHS = 30
 
     train_dataset = CIFAR10ColorizationDataset(train=True)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-
     test_dataset = CIFAR10ColorizationDataset(train=False)
 
     model = UNet().to(device)
 
-    # 修改 1: 损失函数换成 L1Loss
+    # 修改：使用 L1Loss 获得更清晰的边缘
     criterion = nn.L1Loss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    # 针对 5060 开启自动混合精度加速
     scaler = torch.amp.GradScaler('cuda')
 
     print("开始训练...")
     for epoch in range(EPOCHS):
         model.train()
-        for L_batch, ab_batch, _ in train_loader:
+        total_loss = 0
+        loop = tqdm(train_loader, leave=False)
+        for L_batch, ab_batch, _ in loop:
             L_batch, ab_batch = L_batch.to(device), ab_batch.to(device)
 
             optimizer.zero_grad()
@@ -169,8 +174,12 @@ if __name__ == "__main__":
             scaler.step(optimizer)
             scaler.update()
 
-        print(f"Epoch [{epoch + 1}/{EPOCHS}] Loss: {loss.item():.4f}")
+            total_loss += loss.item()
+            loop.set_description(f"Epoch [{epoch + 1}/{EPOCHS}]")
+            loop.set_postfix(loss=loss.item())
 
-    # 训练结束后展示结果
-    print("生成对比图...")
+        print(f"Epoch [{epoch + 1}/{EPOCHS}] 完成，平均 Loss: {total_loss / len(train_loader):.4f}")
+
+    # 结果展示
+    print("正在生成可视化对比图...")
     visualize_results(model, test_dataset, device, num_samples=5)
