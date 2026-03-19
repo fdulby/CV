@@ -182,16 +182,16 @@ if __name__ == "__main__":
 
     # 2. 数据加载 - 将 batch_size 改小为 16
     train_dataset = ImageNetColorizationDataset(root_dir=train_dir)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
 
     # 3. 模型与损失函数初始化
     model = AttentionUNet().to(device)
     criterion_mse = nn.MSELoss()
     criterion_perceptual = PerceptualLoss().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
 
     best_loss = float('inf')
-    num_epochs = 10
+    num_epochs = 20
 
     # 4. 单一训练循环
     for epoch in range(num_epochs):
