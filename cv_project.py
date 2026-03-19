@@ -182,10 +182,13 @@ if __name__ == "__main__":
 
     # 2. 数据加载 - 将 batch_size 改小为 16
     train_dataset = ImageNetColorizationDataset(root_dir=train_dir)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=32, pin_memory=True,prefetch_factor=2,
+    persistent_workers=True)
 
     # 3. 模型与损失函数初始化
     model = AttentionUNet().to(device)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
     criterion_mse = nn.MSELoss()
     criterion_perceptual = PerceptualLoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
@@ -276,3 +279,4 @@ if __name__ == "__main__":
             print(f"[*] 第 {epoch + 1} 轮可视化图已保存至: {vis_path}")
 
     print("训练结束！所有文件均在 /root/autodl-tmp/optimizer_dataset 下。")
+    os.system("shutdown")
