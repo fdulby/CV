@@ -182,7 +182,7 @@ if __name__ == "__main__":
 
     # 2. 数据加载 - 将 batch_size 改小为 16
     train_dataset = ImageNetColorizationDataset(root_dir=train_dir)
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=32, pin_memory=True,prefetch_factor=2,
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=16, pin_memory=True,prefetch_factor=2,
     persistent_workers=True)
 
     # 3. 模型与损失函数初始化
