@@ -142,10 +142,16 @@ class PerceptualLoss(nn.Module):
             param.requires_grad = False
 
     def forward(self, pred_rgb, gt_rgb):
-        # 将输入缩放到 VGG 期望的范围 [0, 1]
-        loss = F.mse_loss(self.loss_network(pred_rgb), self.loss_network(gt_rgb))
-        return loss
+        # 1. 计算预测图的特征（这部分需要梯度，用来更新你的 U-Net）
+        pred_feat = self.loss_network(pred_rgb)
 
+        # 2. 计算原图（真值）的特征
+        # 使用 torch.no_grad() 强制释放这部分的显存占用
+        with torch.no_grad():
+            gt_feat = self.loss_network(gt_rgb)
+
+        # 3. 对比两者的差异
+        return F.mse_loss(pred_feat, gt_feat)
 
 # 辅助函数：Tensor 转 RGB (带梯度支持，用于计算 Perceptual Loss)
 def lab_tensor_to_rgb_tensor(L, ab):
@@ -182,7 +188,7 @@ if __name__ == "__main__":
 
     # 2. 数据加载 - 将 batch_size 改小为 16
     train_dataset = ImageNetColorizationDataset(root_dir=train_dir)
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=16, pin_memory=True,prefetch_factor=2,
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=16, pin_memory=True,prefetch_factor=2,
     persistent_workers=True)
 
     # 3. 模型与损失函数初始化
