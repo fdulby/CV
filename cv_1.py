@@ -144,7 +144,7 @@ if __name__ == "__main__":
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     # 参数设置
-    batch_size = 96
+    batch_size = 64
     num_epochs = 50
     train_losses = []  # 用于记录每轮 Loss
 
@@ -176,7 +176,7 @@ if __name__ == "__main__":
             loss_p = criterion_perceptual(input_vgg_pred, input_vgg_gt)
 
             # 💡 核心修改：将感知损失权重从 0.2 提升至 0.5，对抗灰色
-            total_loss = loss_mse + 0.5 * loss_p
+            total_loss = loss_mse + 0.4 * loss_p
             total_loss.backward()
             optimizer.step()
             running_loss += total_loss.item()
