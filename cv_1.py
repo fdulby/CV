@@ -188,17 +188,17 @@ if __name__ == "__main__":
         train_losses.append(avg_loss)
         print(f"=== Epoch [{epoch + 1}/{num_epochs}] Avg Loss: {avg_loss:.4f} ===")
 
-        # 保存当前轮次的独立权重
-        checkpoint = {
-            'epoch': epoch + 1,
-            'model_state_dict': model.state_dict(),
-            'loss_history': train_losses
-        }
-        torch.save(checkpoint, os.path.join(checkpoint_dir, f'model_epoch_{epoch + 1}.pth'))
-
         if avg_loss < best_loss:
             best_loss = avg_loss
+            checkpoint = {
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+                'loss_history': train_losses,
+            }
             torch.save(checkpoint, os.path.join(checkpoint_dir, 'unet_best.pth'))
+            print(f"[*] 发现更优模型！已更新 best 权重 (loss={best_loss:.6f})")
 
         # 可视化
         model.eval()
