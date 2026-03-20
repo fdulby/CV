@@ -29,6 +29,8 @@ from torchvision import datasets, transforms, models
 from skimage.metrics import peak_signal_noise_ratio as psnr_fn
 from skimage.metrics import structural_similarity as ssim_fn
 import lpips
+from torch.cuda.amp import autocast, GradScaler
+
 
 
 # ============================================================
@@ -51,9 +53,10 @@ CFG = {
     "lr"          : 0.0002,  # Adam 优化器学习率
     "perc_weight" : 0.5,     # 感知损失（Perceptual Loss）的权重系数；越大色彩越鲜艳
     "num_workers" : 16,      # DataLoader 并行加载线程数；CPU 核数较少时可减小
-
+    "use_amp"     : True,   # 是否启用自动混合精度（AMP）
     # ---------- 可视化 ----------
     "vis_test_num": 10,      # 测试集随机可视化图片数量
+
 }
 # ============================================================
 
@@ -611,6 +614,9 @@ if __name__ == "__main__":
     criterion_mse        = nn.MSELoss()
     criterion_perceptual = PerceptualLoss().to(device)
     optimizer            = torch.optim.Adam(model.parameters(), lr=LR)
+    # AMP 梯度缩放器（防止 FP16 梯度下溢）
+    USE_AMP = CFG["use_amp"]
+    scaler = GradScaler(enabled=USE_AMP)
 
     best_val_loss = float("inf")   # 用于判断是否保存最优权重
     train_losses  = []             # 记录每 epoch 训练平均 Loss
@@ -633,20 +639,20 @@ if __name__ == "__main__":
             L, ab = L.to(device), ab.to(device)
 
             optimizer.zero_grad()
-            ab_pred = model(L)
 
-            # MSE 损失：逐像素颜色误差
-            loss_mse = criterion_mse(ab_pred, ab)
+            # AMP 自动混合精度前向计算（FP16 加速）
+            with autocast(enabled=USE_AMP):
+                ab_pred = model(L)
+                loss_mse = criterion_mse(ab_pred, ab)
+                input_vgg_pred = torch.cat([L, ab_pred], dim=1).expand(-1, 3, -1, -1)
+                input_vgg_gt = torch.cat([L, ab], dim=1).expand(-1, 3, -1, -1)
+                loss_p = criterion_perceptual(input_vgg_pred, input_vgg_gt)
+                total_loss = loss_mse + PERC_WEIGHT * loss_p
 
-            # 感知损失：将预测/真实 Lab 拼合后 expand 为 3ch 送入 VGG
-            input_vgg_pred = torch.cat([L, ab_pred], dim=1).expand(-1, 3, -1, -1)
-            input_vgg_gt   = torch.cat([L, ab],      dim=1).expand(-1, 3, -1, -1)
-            loss_p         = criterion_perceptual(input_vgg_pred, input_vgg_gt)
-
-            # 总损失 = MSE + 感知权重 × 感知损失
-            total_loss = loss_mse + PERC_WEIGHT * loss_p
-            total_loss.backward()
-            optimizer.step()
+            # 用 scaler 代替直接 backward/step，防止 FP16 梯度溢出
+            scaler.scale(total_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             running_loss += total_loss.item()
 
@@ -738,8 +744,3 @@ if __name__ == "__main__":
     # 训练结束后自动关机（AutoDL 环境）
     os.system("shutdown")
 
-os.makedirs("output", exist_ok=True)
-with open("output/cv_1_final.py", "w", encoding="utf-8") as f:
-    f.write(code)
-
-print(f"代码已生成，字符数：{len(code)}")
