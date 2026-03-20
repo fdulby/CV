@@ -377,8 +377,8 @@ def validate(model, val_loader, criterion_mse, criterion_perceptual,
             loss_mse = criterion_mse(ab_pred, ab)
 
             # 感知损失（构造 3 通道输入，扩展 Lab → 伪 RGB）
-            input_vgg_pred = torch.cat([L, ab_pred], dim=1).expand(-1, 3, -1, -1)
-            input_vgg_gt   = torch.cat([L, ab],      dim=1).expand(-1, 3, -1, -1)
+            input_vgg_pred = torch.cat([L, ab_pred], dim=1)
+            input_vgg_gt   = torch.cat([L, ab],      dim=1)
             loss_p         = criterion_perceptual(input_vgg_pred, input_vgg_gt)
 
             total_loss = loss_mse + perc_weight * loss_p
@@ -560,6 +560,8 @@ if __name__ == "__main__":
     # 自动选择计算设备（优先 GPU）
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[设备] 使用：{device}")
+    torch.backends.cudnn.benchmark = True
+
     print(f"[超参数] img_size={IMG_SIZE} | batch_size={BATCH_SIZE} | "
           f"num_epochs={NUM_EPOCHS} | lr={LR} | perc_weight={PERC_WEIGHT} | "
           f"num_workers={NUM_WORKERS}")
@@ -605,6 +607,7 @@ if __name__ == "__main__":
     # 7.2 初始化模型、损失函数、优化器
     # ----------------------------------------------------------
     model = AttentionUNet().to(device)
+    model = torch.compile(model)
 
     # 多 GPU 自动并行（若检测到多张 GPU）
     if torch.cuda.device_count() > 1:
@@ -644,8 +647,8 @@ if __name__ == "__main__":
             with autocast(enabled=USE_AMP):
                 ab_pred = model(L)
                 loss_mse = criterion_mse(ab_pred, ab)
-                input_vgg_pred = torch.cat([L, ab_pred], dim=1).expand(-1, 3, -1, -1)
-                input_vgg_gt = torch.cat([L, ab], dim=1).expand(-1, 3, -1, -1)
+                input_vgg_pred = torch.cat([L, ab_pred], dim=1)
+                input_vgg_gt = torch.cat([L, ab], dim=1)
                 loss_p = criterion_perceptual(input_vgg_pred, input_vgg_gt)
                 total_loss = loss_mse + PERC_WEIGHT * loss_p
 
