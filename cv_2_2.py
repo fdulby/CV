@@ -26,7 +26,7 @@ CONFIG = {
     'num_epochs': 50,
     'learning_rate': 0.00005,
     'img_size': 256,
-    'num_workers': 16,
+    'num_workers': 32,
     'perceptual_weight': 0.5,  # 感知损失的权重
     'seed': 42  # 随机种子，保证测试集抽图可复现
 }
