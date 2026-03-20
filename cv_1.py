@@ -161,8 +161,35 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
     best_loss = float('inf')
 
+ #这一段用于继续48轮的训练
+    # --- 新增：断点续训加载逻辑 ---
+    start_epoch = 0
+    resume_path = os.path.join(checkpoint_dir, 'model_epoch_48.pth')
+
+    if os.path.exists(resume_path):
+        print(f"检测到第48轮权重，正在恢复训练...")
+        checkpoint = torch.load(resume_path, map_location=device)
+
+        # 加载模型权重 (处理 DataParallel 的 module. 前缀)
+        state_dict = checkpoint['model_state_dict']
+        if not torch.cuda.device_count() > 1 and list(state_dict.keys())[0].startswith('module.'):
+            from collections import OrderedDict
+
+            new_state_dict = OrderedDict()
+            for k, v in state_dict.items():
+                new_state_dict[k[7:]] = v
+            model.load_state_dict(new_state_dict)
+        else:
+            model.load_state_dict(state_dict)
+
+        # 恢复起始轮数和 Loss 历史
+        start_epoch = checkpoint['epoch']
+        train_losses = checkpoint.get('loss_history', [])
+        print(f"恢复成功！将从第 {start_epoch + 1} 轮开始训练。")
+    # -----------------------------
+
     print("训练启动")
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch,num_epochs):
         model.train()
         running_loss = 0.0
         for i, (L, ab) in enumerate(train_loader):
@@ -192,6 +219,7 @@ if __name__ == "__main__":
         checkpoint = {
             'epoch': epoch + 1,
             'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
             'loss_history': train_losses
         }
         torch.save(checkpoint, os.path.join(checkpoint_dir, f'model_epoch_{epoch + 1}.pth'))
@@ -224,9 +252,9 @@ if __name__ == "__main__":
     plt.figure(figsize=(10, 5))
     plt.plot(range(1, num_epochs + 1), train_losses, 'b-o', label='Train Loss')
     plt.title('Training Loss Curve')
-    plt.xlabel('Epoch');
-    plt.ylabel('Loss');
-    plt.grid(True);
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.grid(True)
     plt.legend()
     plt.savefig(os.path.join(checkpoint_dir, 'loss_curve.png'))
     plt.close()
