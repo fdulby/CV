@@ -22,9 +22,9 @@ CONFIG = {
     'val_dir': '/root/autodl-tmp/ImageNet100/val',
     'test_dir': '/root/autodl-tmp/ImageNet100/test',
     'save_dir': '/root/autodl-tmp/op_1',
-    'batch_size': 64,
+    'batch_size': 96,
     'num_epochs': 50,
-    'learning_rate': 0.0002,
+    'learning_rate': 0.00005,
     'img_size': 256,
     'num_workers': 16,
     'perceptual_weight': 0.5,  # 感知损失的权重
