@@ -204,7 +204,8 @@ if __name__ == "__main__":
     criterion_mse = nn.MSELoss()
     criterion_perceptual = PerceptualLoss().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG['learning_rate'])
-
+    # 💡 新增：初始化 AMP 的梯度缩放器
+    scaler = torch.cuda.amp.GradScaler()
     # 记录列表
     train_losses = []
     val_losses = []
@@ -218,19 +219,25 @@ if __name__ == "__main__":
         running_train_loss = 0.0
         for i, (L, ab) in enumerate(train_loader):
             L, ab = L.to(device), ab.to(device)
+
             optimizer.zero_grad()
 
-            ab_pred = model(L)
+            # 💡 新增：开启自动混合精度上下文
+            with torch.cuda.amp.autocast():
+                # --- 前向传播与计算 Loss (这些会在半精度下超快运行) ---
+                ab_pred = model(L)
 
-            loss_mse = criterion_mse(ab_pred, ab)
-            # 构建伪 RGB 以适配 VGG (3通道)
-            input_vgg_pred = torch.cat([L, ab_pred], dim=1).expand(-1, 3, -1, -1)
-            input_vgg_gt = torch.cat([L, ab], dim=1).expand(-1, 3, -1, -1)
-            loss_p = criterion_perceptual(input_vgg_pred, input_vgg_gt)
+                loss_mse = criterion_mse(ab_pred, ab)
+                input_vgg_pred = torch.cat([L, ab_pred], dim=1)
+                input_vgg_gt = torch.cat([L, ab], dim=1)
+                loss_p = criterion_perceptual(input_vgg_pred, input_vgg_gt)
 
-            total_loss = loss_mse + CONFIG['perceptual_weight'] * loss_p
-            total_loss.backward()
-            optimizer.step()
+                total_loss = loss_mse + CONFIG['perceptual_weight'] * loss_p
+
+            # 💡 修改：使用 scaler 进行反向传播和参数更新
+            scaler.scale(total_loss).backward()  # 缩放 Loss 并反向传播
+            scaler.step(optimizer)  # 更新参数
+            scaler.update()  # 更新缩放器的比例因子
 
             running_train_loss += total_loss.item()
             if (i + 1) % 100 == 0:
