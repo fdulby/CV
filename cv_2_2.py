@@ -5,6 +5,8 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms, models
 import numpy as np
 import cv2
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import os
 import random
