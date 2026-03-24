@@ -47,7 +47,7 @@ class ImageNetColorizationDataset(Dataset):
             transforms.Resize((img_size, img_size)),
             transforms.CenterCrop(img_size)
         ]
-        # 仅在训练集应用数据增强
+        # 在训练集应用数据增强
         if is_train:
             transform_list.insert(1, transforms.RandomHorizontalFlip())
 
