@@ -278,14 +278,9 @@ class ColorizationDataset(Dataset):
         item = self.samples[idx]
         lab = pil_to_lab(resize_rgb_image(pil_load_rgb(item["path"]), self.cfg["image_size"]))
         L, ab = lab[:, :, 0], lab[:, :, 1:3]
-        soft_idx, soft_w, q_gt = soft_encode_ab_sparse(ab, self.ab_bins, self.cfg["soft_k"], self.cfg["soft_sigma"])
         return {
             "L": torch.from_numpy(normalize_L_channel(L, self.cfg)[None, :, :]).float(),
             "ab": torch.from_numpy(ab.transpose(2, 0, 1)).float(),
-            "soft_idx": torch.from_numpy(soft_idx).long(),
-            "soft_w": torch.from_numpy(soft_w).float(),
-            "q_gt": torch.from_numpy(q_gt).long(),
-            "class_weight": torch.from_numpy(self.class_weights[q_gt]).float(),
             "path": item["path"]
         }
 
@@ -302,7 +297,10 @@ def build_dataloaders(paths, cfg):
                                   pin_memory=cfg["pin_memory"], drop_last=is_train,
                                   persistent_workers=cfg["num_workers"] > 0))
 
-    return loaders[0], loaders[1], loaders[2], {"ab_bins": torch.from_numpy(ab_bins).float()}
+    return loaders[0], loaders[1], loaders[2], {
+        "ab_bins": torch.from_numpy(ab_bins).float(),
+        "class_weights": torch.from_numpy(class_weights).float()  # 新增：将权重传出
+    }
 
 
 # =========================================================
@@ -375,33 +373,48 @@ class RebalancedSoftCrossEntropyLoss(nn.Module):
 # =========================================================
 
 @torch.no_grad()
-def annealed_mean_from_logits(logits, ab_bins, T=0.38, eps=1e-8):
-    probs = torch.clamp(F.softmax(logits, dim=1), min=eps)
-    annealed = torch.exp(torch.log(probs) / T)
-    annealed = annealed / torch.clamp(annealed.sum(dim=1, keepdim=True), min=eps)
-    return torch.einsum("bqhw,qc->bchw", annealed, ab_bins.to(logits.device).float())
+def annealed_mean_from_logits(logits, ab_bins, T=0.38):
+    # 直接在 Softmax 内部处理温度 T，原生的算子高度优化且绝对稳定
+    probs = F.softmax(logits / T, dim=1)
+    return torch.einsum("bqhw,qc->bchw", probs, ab_bins.to(logits.device).float())
 
 
 # =========================================================
 # 8) 训练/验证循环
 # =========================================================
+# 新增一个 GPU 上的软编码函数 (放在 train_one_epoch 上方)
+def soft_encode_ab_gpu(ab_b2hw, ab_bins_q2, k=5, sigma=5.0):
+    B, _, H, W = ab_b2hw.shape
+    ab_flat = ab_b2hw.view(B, 2, -1).permute(0, 2, 1)  # [B, H*W, 2]
+    d2 = torch.cdist(ab_flat, ab_bins_q2) ** 2  # 计算欧式距离平方 [B, H*W, Q]
+    knn_d2, knn_idx = torch.topk(d2, k, dim=-1, largest=False)
 
-def train_one_epoch(model, loader, optimizer, criterion, scaler, device, ab_bins, cfg):
+    soft_w = torch.exp(-knn_d2 / (2.0 * sigma ** 2))
+    soft_w = soft_w / (soft_w.sum(dim=-1, keepdim=True) + 1e-12)
+
+    return knn_idx.permute(0, 2, 1).view(B, k, H, W), soft_w.permute(0, 2, 1).view(B, k, H, W)
+
+
+def train_one_epoch(model, loader, optimizer, criterion, scaler, device, ab_bins, cfg, class_weights):
     model.train()
     running_loss = 0.0
+    # 提前把权重丢到 GPU
+    class_weights = class_weights.to(device)
+
     for batch in loader:
-        L, soft_idx, soft_w, class_weight = batch["L"].to(device), batch["soft_idx"].to(device), batch["soft_w"].to(
-            device), batch["class_weight"].to(device)
+        L = batch["L"].to(device)
+        ab = batch["ab"].to(device)
+
+        # 【核心改动】：在 GPU 上飞速计算 Target
+        with torch.no_grad():
+            soft_idx, soft_w = soft_encode_ab_gpu(ab, ab_bins, cfg["soft_k"], cfg["soft_sigma"])
+            # 取最近邻居作为 ground truth index，并映射出每个像素的 class_weight
+            q_gt = soft_idx[:, 0, :, :]
+            class_weight = class_weights[q_gt]
+
         optimizer.zero_grad(set_to_none=True)
         with autocast(enabled=cfg["use_amp"]):
             loss = criterion(model(L), soft_idx, soft_w, class_weight)
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip_norm"])
-        scaler.step(optimizer)
-        scaler.update()
-        running_loss += loss.item()
-    return running_loss / len(loader)
 
 
 @torch.no_grad()
@@ -466,67 +479,75 @@ def test_and_visualize(model, loader, device, ab_bins, cfg):
 # =========================================================
 
 def main():
-    set_seed(CFG["seed"])
-    ensure_dir(CFG["checkpoint_dir"])
+    try:
+        set_seed(CFG["seed"])
+        ensure_dir(CFG["checkpoint_dir"])
 
-    print("构建数据流...")
-    train_loader, val_loader, test_loader, meta = build_dataloaders(PATHS, CFG)
-    ab_bins = meta["ab_bins"].to(CFG["device"])
+        print("构建数据流...")
+        train_loader, val_loader, test_loader, meta = build_dataloaders(PATHS, CFG)
+        ab_bins = meta["ab_bins"].to(CFG["device"])
 
-    print("初始化模型 (多卡并行检测)...")
-    model = UNetColorization(in_channels=CFG["in_channels"], num_classes=CFG["num_classes"],
-                             base_ch=CFG["base_channels"])
+        print("初始化模型 (多卡并行检测)...")
+        model = UNetColorization(in_channels=CFG["in_channels"], num_classes=CFG["num_classes"],
+                                 base_ch=CFG["base_channels"])
 
-    # 【多卡配置核心】利用 nn.DataParallel 调用两张 5090
-    if torch.cuda.device_count() > 1:
-        print(f"检测到 {torch.cuda.device_count()} 张 GPU，启用 DataParallel 模式。")
-        model = nn.DataParallel(model)
-    model = model.to(CFG["device"])
+        # 【多卡配置核心】利用 nn.DataParallel 调用两张 5090
+        if torch.cuda.device_count() > 1:
+            print(f"检测到 {torch.cuda.device_count()} 张 GPU，启用 DataParallel 模式。")
+            model = nn.DataParallel(model)
+        model = model.to(CFG["device"])
 
-    criterion = RebalancedSoftCrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=CFG["lr"], betas=CFG["betas"], weight_decay=CFG["weight_decay"])
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=CFG["lr_milestones_epoch"],
-                                                     gamma=CFG["lr_gamma"])
-    scaler = GradScaler(enabled=CFG["use_amp"])
+        criterion = RebalancedSoftCrossEntropyLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=CFG["lr"], betas=CFG["betas"],
+                                     weight_decay=CFG["weight_decay"])
+        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=CFG["lr_milestones_epoch"],
+                                                         gamma=CFG["lr_gamma"])
+        scaler = GradScaler(enabled=CFG["use_amp"])
 
-    best_val_loss = float("inf")
-    train_losses_history, val_losses_history = [], []
+        best_val_loss = float("inf")
+        train_losses_history, val_losses_history = [], []
 
-    print("开始训练...")
-    for epoch in range(1, CFG["epochs"] + 1):
-        t_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, CFG["device"], ab_bins, CFG)
-        v_loss = validate_one_epoch(model, val_loader, criterion, CFG["device"], ab_bins, CFG)
-        scheduler.step()
+        print("开始训练...")
+        for epoch in range(1, CFG["epochs"] + 1):
+            t_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, CFG["device"], ab_bins, CFG)
+            v_loss = validate_one_epoch(model, val_loader, criterion, CFG["device"], ab_bins, CFG)
+            scheduler.step()
 
-        train_losses_history.append(t_loss)
-        val_losses_history.append(v_loss)
+            train_losses_history.append(t_loss)
+            val_losses_history.append(v_loss)
 
-        print(
-            f"Epoch [{epoch:03d}/{CFG['epochs']}] | lr: {optimizer.param_groups[0]['lr']:.6f} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f}")
+            print(
+                f"Epoch [{epoch:03d}/{CFG['epochs']}] | lr: {optimizer.param_groups[0]['lr']:.6f} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f}")
 
-        # 保存权重
-        if v_loss < best_val_loss:
-            best_val_loss = v_loss
-            torch.save({"model": model.state_dict()}, os.path.join(CFG["checkpoint_dir"], "best.pt"))
+            # 保存权重
+            if v_loss < best_val_loss:
+                best_val_loss = v_loss
+                # 剥离 DataParallel 外壳，防止键值污染
+                model_to_save = model.module if isinstance(model, nn.DataParallel) else model
+                torch.save({"model": model_to_save.state_dict()}, os.path.join(CFG["checkpoint_dir"], "best.pt"))
+        # 【生成并保存 Loss 可视化图】
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, CFG["epochs"] + 1), train_losses_history, label='Train Loss', marker='o')
+        plt.plot(range(1, CFG["epochs"] + 1), val_losses_history, label='Val Loss', marker='s')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training and Validation Loss Curve')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(CFG["loss_curve_path"])
+        plt.close()
+        print(f"训练完成！Loss 曲线已保存至: {CFG['loss_curve_path']}")
 
-    # 【生成并保存 Loss 可视化图】
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, CFG["epochs"] + 1), train_losses_history, label='Train Loss', marker='o')
-    plt.plot(range(1, CFG["epochs"] + 1), val_losses_history, label='Val Loss', marker='s')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss Curve')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(CFG["loss_curve_path"])
-    plt.close()
-    print(f"训练完成！Loss 曲线已保存至: {CFG['loss_curve_path']}")
+        # 【测试并提取 10 张结果图】
+        print("加载最优权重进入测试阶段...")
+        model.load_state_dict(torch.load(os.path.join(CFG["checkpoint_dir"], "best.pt"))["model"])
+        test_and_visualize(model, test_loader, CFG["device"], ab_bins, CFG)
+        print("全部流程执行完毕！")
 
-    # 【测试并提取 10 张结果图】
-    print("加载最优权重进入测试阶段...")
-    model.load_state_dict(torch.load(os.path.join(CFG["checkpoint_dir"], "best.pt"))["model"])
-    test_and_visualize(model, test_loader, CFG["device"], ab_bins, CFG)
-    print("全部流程执行完毕！")
+    finally:
+        # 无论正常结束还是中途报错，都会执行此处的关机命令
+        print("\n[System] 正在执行自动关机指令...")
+        os.system("shutdown -h now")
 
 
 if __name__ == "__main__":
