@@ -11,6 +11,7 @@ from collections import defaultdict
 import numpy as np
 from PIL import Image
 from skimage.color import rgb2lab, lab2rgb
+from tqdm import tqdm  # 【新增】引入进度条
 
 import torch
 import torch.nn as nn
@@ -234,12 +235,17 @@ def soft_encode_ab_sparse(ab_hw2: np.ndarray, ab_bins_q2: np.ndarray, k: int = 5
 
 
 def load_or_compute_prior_and_weights(paths, cfg, train_samples, ab_bins_q2):
+    # 1. 检查缓存机制：只要存在 .npy 文件，就会瞬间读取，跳过计算
     if os.path.exists(paths["ab_prior_npy"]) and os.path.exists(paths["ab_weights_npy"]):
+        print("\n[Data] 找到已缓存的色彩先验文件，直接跳过统计并加载！")
         return np.load(paths["ab_prior_npy"]).astype(np.float32), np.load(paths["ab_weights_npy"]).astype(np.float32)
 
+    print(f"\n[Data] 未找到先验缓存，正在全局统计 {len(train_samples)} 张图片的色彩分布 (仅需执行一次)...")
     Q = ab_bins_q2.shape[0]
     counts = np.zeros(Q, dtype=np.float64)
-    for item in train_samples:
+
+    # 2. 加入 tqdm 进度条，遍历全量 train_samples
+    for item in tqdm(train_samples, desc="计算全量色彩先验"):
         img = resize_rgb_image(pil_load_rgb(item["path"]), cfg["prior_resize_for_stats"])
         ab = pil_to_lab(img)[:, :, 1:3]
         d2 = np.sum((ab.reshape(-1, 2)[:, None, :] - ab_bins_q2[None, :, :]) ** 2, axis=2)
@@ -257,9 +263,12 @@ def load_or_compute_prior_and_weights(paths, cfg, train_samples, ab_bins_q2):
     weights = 1.0 / np.maximum(mixed, 1e-12)
     weights = weights / np.maximum(np.sum(prior_smooth * weights), 1e-12)
 
+    # 3. 第一次计算完成后，保存为 .npy 供以后永久使用
     ensure_parent(paths["ab_prior_npy"])
     np.save(paths["ab_prior_npy"], prior_smooth.astype(np.float32))
     np.save(paths["ab_weights_npy"], weights.astype(np.float32))
+    print("[Data] 全局色彩先验统计完成，并已永久保存至缓存！\n")
+
     return prior_smooth.astype(np.float32), weights.astype(np.float32)
 
 
