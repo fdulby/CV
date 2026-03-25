@@ -380,13 +380,12 @@ def annealed_mean_from_logits(logits, ab_bins, T=0.38):
 
 
 # =========================================================
-# 8) 训练/验证循环
+# 8) 训练/验证循环 (修复版)
 # =========================================================
-# 新增一个 GPU 上的软编码函数 (放在 train_one_epoch 上方)
 def soft_encode_ab_gpu(ab_b2hw, ab_bins_q2, k=5, sigma=5.0):
     B, _, H, W = ab_b2hw.shape
-    ab_flat = ab_b2hw.view(B, 2, -1).permute(0, 2, 1)  # [B, H*W, 2]
-    d2 = torch.cdist(ab_flat, ab_bins_q2) ** 2  # 计算欧式距离平方 [B, H*W, Q]
+    ab_flat = ab_b2hw.view(B, 2, -1).permute(0, 2, 1)
+    d2 = torch.cdist(ab_flat, ab_bins_q2) ** 2
     knn_d2, knn_idx = torch.topk(d2, k, dim=-1, largest=False)
 
     soft_w = torch.exp(-knn_d2 / (2.0 * sigma ** 2))
@@ -398,17 +397,14 @@ def soft_encode_ab_gpu(ab_b2hw, ab_bins_q2, k=5, sigma=5.0):
 def train_one_epoch(model, loader, optimizer, criterion, scaler, device, ab_bins, cfg, class_weights):
     model.train()
     running_loss = 0.0
-    # 提前把权重丢到 GPU
     class_weights = class_weights.to(device)
 
     for batch in loader:
         L = batch["L"].to(device)
         ab = batch["ab"].to(device)
 
-        # 【核心改动】：在 GPU 上飞速计算 Target
         with torch.no_grad():
             soft_idx, soft_w = soft_encode_ab_gpu(ab, ab_bins, cfg["soft_k"], cfg["soft_sigma"])
-            # 取最近邻居作为 ground truth index，并映射出每个像素的 class_weight
             q_gt = soft_idx[:, 0, :, :]
             class_weight = class_weights[q_gt]
 
@@ -416,15 +412,34 @@ def train_one_epoch(model, loader, optimizer, criterion, scaler, device, ab_bins
         with autocast(enabled=cfg["use_amp"]):
             loss = criterion(model(L), soft_idx, soft_w, class_weight)
 
+        # 【修复】：反向传播与优化器更新
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        running_loss += loss.item()
+
+    return running_loss / len(loader)  # 【修复】：返回 loss
+
 
 @torch.no_grad()
-def validate_one_epoch(model, loader, criterion, device, ab_bins, cfg):
+def validate_one_epoch(model, loader, criterion, device, ab_bins, cfg, class_weights):
     model.eval()
     running_loss = 0.0
+    class_weights = class_weights.to(device)  # 【修复】：传入类别权重
+
     for batch in loader:
+        L = batch["L"].to(device)
+        ab = batch["ab"].to(device)
+
+        # 【修复】：验证集同样需要在 GPU 上实时计算 Target
+        soft_idx, soft_w = soft_encode_ab_gpu(ab, ab_bins, cfg["soft_k"], cfg["soft_sigma"])
+        q_gt = soft_idx[:, 0, :, :]
+        class_weight = class_weights[q_gt]
+
         with autocast(enabled=cfg["use_amp"]):
-            running_loss += criterion(model(batch["L"].to(device)), batch["soft_idx"].to(device),
-                                      batch["soft_w"].to(device), batch["class_weight"].to(device)).item()
+            loss = criterion(model(L), soft_idx, soft_w, class_weight)
+            running_loss += loss.item()
+
     return running_loss / len(loader)
 
 
@@ -475,7 +490,7 @@ def test_and_visualize(model, loader, device, ab_bins, cfg):
 
 
 # =========================================================
-# 10) 主控制流
+# 10) 主控制流 (修正版)
 # =========================================================
 
 def main():
@@ -486,12 +501,14 @@ def main():
         print("构建数据流...")
         train_loader, val_loader, test_loader, meta = build_dataloaders(PATHS, CFG)
         ab_bins = meta["ab_bins"].to(CFG["device"])
+        # 【修改 1】：提取类别权重
+        class_weights = meta["class_weights"]
 
         print("初始化模型 (多卡并行检测)...")
         model = UNetColorization(in_channels=CFG["in_channels"], num_classes=CFG["num_classes"],
                                  base_ch=CFG["base_channels"])
 
-        # 【多卡配置核心】利用 nn.DataParallel 调用两张 5090
+        # 【多卡配置核心】利用 nn.DataParallel 调用多卡
         if torch.cuda.device_count() > 1:
             print(f"检测到 {torch.cuda.device_count()} 张 GPU，启用 DataParallel 模式。")
             model = nn.DataParallel(model)
@@ -509,8 +526,10 @@ def main():
 
         print("开始训练...")
         for epoch in range(1, CFG["epochs"] + 1):
-            t_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, CFG["device"], ab_bins, CFG)
-            v_loss = validate_one_epoch(model, val_loader, criterion, CFG["device"], ab_bins, CFG)
+            # 【修改 2】：将 class_weights 传入训练和验证函数
+            t_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, CFG["device"], ab_bins, CFG,
+                                     class_weights)
+            v_loss = validate_one_epoch(model, val_loader, criterion, CFG["device"], ab_bins, CFG, class_weights)
             scheduler.step()
 
             train_losses_history.append(t_loss)
@@ -525,6 +544,7 @@ def main():
                 # 剥离 DataParallel 外壳，防止键值污染
                 model_to_save = model.module if isinstance(model, nn.DataParallel) else model
                 torch.save({"model": model_to_save.state_dict()}, os.path.join(CFG["checkpoint_dir"], "best.pt"))
+
         # 【生成并保存 Loss 可视化图】
         plt.figure(figsize=(10, 6))
         plt.plot(range(1, CFG["epochs"] + 1), train_losses_history, label='Train Loss', marker='o')
