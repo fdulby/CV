@@ -7,6 +7,7 @@ import json
 import random
 from pathlib import Path
 from collections import defaultdict
+import traceback
 
 import numpy as np
 from PIL import Image
@@ -499,7 +500,7 @@ def test_and_visualize(model, loader, device, ab_bins, cfg):
 
 
 # =========================================================
-# 10) 主控制流 (修正版)
+# 10) 主控制流 (捕获报错版本)
 # =========================================================
 
 def main():
@@ -507,71 +508,27 @@ def main():
         set_seed(CFG["seed"])
         ensure_dir(CFG["checkpoint_dir"])
 
-        print("构建数据流...")
-        train_loader, val_loader, test_loader, meta = build_dataloaders(PATHS, CFG)
-        ab_bins = meta["ab_bins"].to(CFG["device"])
-        # 【修改 1】：提取类别权重
-        class_weights = meta["class_weights"]
-
-        print("初始化模型 (多卡并行检测)...")
-        model = UNetColorization(in_channels=CFG["in_channels"], num_classes=CFG["num_classes"],
-                                 base_ch=CFG["base_channels"])
-
-        # 【多卡配置核心】利用 nn.DataParallel 调用多卡
-        if torch.cuda.device_count() > 1:
-            print(f"检测到 {torch.cuda.device_count()} 张 GPU，启用 DataParallel 模式。")
-            model = nn.DataParallel(model)
-        model = model.to(CFG["device"])
-
-        criterion = RebalancedSoftCrossEntropyLoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=CFG["lr"], betas=CFG["betas"],
-                                     weight_decay=CFG["weight_decay"])
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=CFG["lr_milestones_epoch"],
-                                                         gamma=CFG["lr_gamma"])
-        scaler = GradScaler(enabled=CFG["use_amp"])
-
-        best_val_loss = float("inf")
-        train_losses_history, val_losses_history = [], []
-
-        print("开始训练...")
-        for epoch in range(1, CFG["epochs"] + 1):
-            # 【修改 2】：将 class_weights 传入训练和验证函数
-            t_loss = train_one_epoch(model, train_loader, optimizer, criterion, scaler, CFG["device"], ab_bins, CFG,
-                                     class_weights)
-            v_loss = validate_one_epoch(model, val_loader, criterion, CFG["device"], ab_bins, CFG, class_weights)
-            scheduler.step()
-
-            train_losses_history.append(t_loss)
-            val_losses_history.append(v_loss)
-
-            print(
-                f"Epoch [{epoch:03d}/{CFG['epochs']}] | lr: {optimizer.param_groups[0]['lr']:.6f} | Train Loss: {t_loss:.4f} | Val Loss: {v_loss:.4f}")
-
-            # 保存权重
-            if v_loss < best_val_loss:
-                best_val_loss = v_loss
-                # 剥离 DataParallel 外壳，防止键值污染
-                model_to_save = model.module if isinstance(model, nn.DataParallel) else model
-                torch.save({"model": model_to_save.state_dict()}, os.path.join(CFG["checkpoint_dir"], "best.pt"))
-
-        # 【生成并保存 Loss 可视化图】
-        plt.figure(figsize=(10, 6))
-        plt.plot(range(1, CFG["epochs"] + 1), train_losses_history, label='Train Loss', marker='o')
-        plt.plot(range(1, CFG["epochs"] + 1), val_losses_history, label='Val Loss', marker='s')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training and Validation Loss Curve')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(CFG["loss_curve_path"])
-        plt.close()
-        print(f"训练完成！Loss 曲线已保存至: {CFG['loss_curve_path']}")
+        # ... [中间你所有的构建数据、初始化模型、训练循环代码保持完全不变] ...
+        # (不要修改 try 里面的训练逻辑)
 
         # 【测试并提取 10 张结果图】
         print("加载最优权重进入测试阶段...")
         model.load_state_dict(torch.load(os.path.join(CFG["checkpoint_dir"], "best.pt"))["model"])
         test_and_visualize(model, test_loader, CFG["device"], ab_bins, CFG)
         print("全部流程执行完毕！")
+
+    except Exception as e:
+        # 【新增】：拦截并保存报错信息
+        print(f"\n[Crash] 程序发生崩溃！错误原因: {e}")
+        error_log_path = "/root/autodl-tmp/op_2/error_log.txt"
+        ensure_parent(error_log_path)
+        with open(error_log_path, "w", encoding="utf-8") as f:
+            traceback.print_exc(file=f)
+        print(f"[Crash] 详细报错堆栈已保存至: {error_log_path}")
+
+        # 故意让程序暂停 30 秒，方便你在终端看到上面的红色报错提示
+        print("系统将在 30 秒后自动关机，请及时查看上方报错或下载 error_log.txt...")
+        time.sleep(30)
 
     finally:
         # 无论正常结束还是中途报错，都会执行此处的关机命令
