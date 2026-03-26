@@ -46,8 +46,8 @@ CFG = {
     "test_ratio": 0.1,
 
     "image_size": 224,
-    "batch_size": 128,  # 双卡 5090 显存充足，建议 64 或 128
-    "num_workers": 24,
+    "batch_size": 64,  # 双卡 5090 显存充足，建议 64 或 128
+    "num_workers": 16,
     "pin_memory": True,
 
     "num_color_bins": 313,
@@ -63,7 +63,7 @@ CFG = {
 
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     "epochs": 50,
-    "lr": 1e-4,
+    "lr": 5e-5,
     "betas": (0.9, 0.99),
     "weight_decay": 1e-3,
 
